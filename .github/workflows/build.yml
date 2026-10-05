@@ -1,0 +1,305 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ScreenTime"
+          include(":app")
+          EOF_0
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_2
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "com.example.screentime"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.screentime"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+          }
+          EOF_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+              <uses-permission
+                  android:name="android.permission.PACKAGE_USAGE_STATS"
+                  tools:ignore="ProtectedPermissions" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:label="Screen Time"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p app/src/main/java/com/example/screentime
+          cat > app/src/main/java/com/example/screentime/MainActivity.kt <<'EOF_5'
+          package com.example.screentime
+
+          import android.app.AppOpsManager
+          import android.app.usage.UsageStatsManager
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.os.Process
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.lifecycle.compose.LocalLifecycleOwner
+          import androidx.compose.ui.unit.dp
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.LifecycleEventObserver
+          import java.util.Calendar
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { ScreenTimeApp() } } }
+              }
+          }
+
+          data class AppUsage(val name: String, val millis: Long)
+
+          fun hasUsageAccess(ctx: Context): Boolean {
+              val ops = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+              val mode = ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), ctx.packageName)
+              return mode == AppOpsManager.MODE_ALLOWED
+          }
+
+          fun dayStart(daysAgo: Int): Long = Calendar.getInstance().apply {
+              add(Calendar.DAY_OF_YEAR, -daysAgo)
+              set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+              set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+          }.timeInMillis
+
+          fun usageBetween(ctx: Context, start: Long, end: Long): List<AppUsage> {
+              val usm = ctx.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+              val pm = ctx.packageManager
+              return usm.queryAndAggregateUsageStats(start, end).values
+                  .filter { it.totalTimeInForeground > 0 && pm.getLaunchIntentForPackage(it.packageName) != null }
+                  .map {
+                      val label = runCatching {
+                          pm.getApplicationLabel(pm.getApplicationInfo(it.packageName, 0)).toString()
+                      }.getOrDefault(it.packageName)
+                      AppUsage(label, it.totalTimeInForeground)
+                  }
+                  .sortedByDescending { it.millis }
+          }
+
+          /** Foreground time across all yearly buckets Android still has, plus the earliest date found. */
+          fun lifetimeUsage(ctx: Context): Pair<Long, Long> {
+              val usm = ctx.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+              val pm = ctx.packageManager
+              val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_YEARLY, 0, System.currentTimeMillis())
+                  .filter { it.totalTimeInForeground > 0 && pm.getLaunchIntentForPackage(it.packageName) != null }
+              val total = stats.sumOf { it.totalTimeInForeground }
+              val since = stats.minOfOrNull { it.firstTimeStamp } ?: System.currentTimeMillis()
+              return total to since
+          }
+
+          fun f1(x: Double) = "%.1f".format(x)
+
+          fun fmtLong(ms: Long): String {
+              val h = ms / 3_600_000
+              return "$h \u0998\u09a3\u09cd\u099f\u09be (\u2248 ${f1(h / 24.0)} \u09a6\u09bf\u09a8)"
+          }
+
+          fun fmt(ms: Long): String {
+              val m = ms / 60_000
+              return if (m >= 60) "${m / 60} \u0998\u09a3\u09cd\u099f\u09be ${m % 60} \u09ae\u09bf\u09a8\u09bf\u099f" else "$m \u09ae\u09bf\u09a8\u09bf\u099f"
+          }
+
+          @Composable
+          fun InfoCard(title: String, body: String) {
+              Card(Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(12.dp)) {
+                      Text(title, style = MaterialTheme.typography.titleSmall)
+                      Spacer(Modifier.height(4.dp))
+                      Text(body, style = MaterialTheme.typography.bodyMedium)
+                  }
+              }
+          }
+
+          @Composable
+          fun ScreenTimeApp() {
+              val ctx = LocalContext.current
+              var granted by remember { mutableStateOf(hasUsageAccess(ctx)) }
+
+              val owner = LocalLifecycleOwner.current
+              DisposableEffect(owner) {
+                  val obs = LifecycleEventObserver { _, e ->
+                      if (e == Lifecycle.Event.ON_RESUME) granted = hasUsageAccess(ctx)
+                  }
+                  owner.lifecycle.addObserver(obs)
+                  onDispose { owner.lifecycle.removeObserver(obs) }
+              }
+
+              if (!granted) {
+                  Column(
+                      Modifier.fillMaxSize().padding(24.dp),
+                      verticalArrangement = Arrangement.Center,
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      Text("\u09b8\u09cd\u0995\u09cd\u09b0\u09bf\u09a8 \u099f\u09be\u0987\u09ae \u09a6\u09c7\u0996\u09a4\u09c7 'Usage access' \u0985\u09a8\u09c1\u09ae\u09a4\u09bf \u09a6\u09bf\u09a8", style = MaterialTheme.typography.titleMedium)
+                      Spacer(Modifier.height(16.dp))
+                      Button(onClick = { ctx.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }) {
+                          Text("\u09b8\u09c7\u099f\u09bf\u0982\u09b8 \u0996\u09c1\u09b2\u09c1\u09a8")
+                      }
+                  }
+                  return
+              }
+
+              val prefs = remember { ctx.getSharedPreferences("st", Context.MODE_PRIVATE) }
+              var years by remember { mutableStateOf(prefs.getInt("years", 5)) }
+
+              val now = System.currentTimeMillis()
+              val todayApps = remember(granted) { usageBetween(ctx, dayStart(0), now) }
+              val week = remember(granted) {
+                  (6 downTo 0).map { d ->
+                      val end = if (d == 0) now else dayStart(d - 1)
+                      usageBetween(ctx, dayStart(d), end).sumOf { it.millis }
+                  }
+              }
+              val (lifeTotal, lifeSince) = remember(granted) { lifetimeUsage(ctx) }
+              val total = todayApps.sumOf { it.millis }
+              val maxDay = (week.maxOrNull() ?: 1L).coerceAtLeast(1L)
+
+              // Estimate: average of completed recent days x days in N years
+              val done = week.dropLast(1).filter { it > 0 }
+              val avgDaily = if (done.isNotEmpty()) done.average() else total.toDouble()
+              val estHours = avgDaily * 365.0 * years / 3_600_000.0
+              val awakePct = estHours / (years * 365.0 * 16.0) * 100.0
+
+              val ideas = listOf(
+                  "\u099c\u09c7\u0997\u09c7 \u09a5\u09be\u0995\u09be \u09b8\u09ae\u09af\u09bc\u09c7\u09b0 \u0985\u0982\u09b6" to "\u098f\u0987 \u09b8\u09ae\u09af\u09bc \u0986\u09aa\u09a8\u09be\u09b0 \u099c\u09c7\u0997\u09c7 \u09a5\u09be\u0995\u09be \u09b8\u09ae\u09af\u09bc\u09c7\u09b0 \u09aa\u09cd\u09b0\u09be\u09af\u09bc ${f1(awakePct)}%",
+                  "\u09a8\u09a4\u09c1\u09a8 \u09ad\u09be\u09b7\u09be" to "${f1(estHours / 600)} \u099f\u09bf \u09a8\u09a4\u09c1\u09a8 \u09ad\u09be\u09b7\u09be \u09ae\u09cb\u099f\u09be\u09ae\u09c1\u099f\u09bf \u09b8\u09be\u09ac\u09b2\u09c0\u09b2\u09ad\u09be\u09ac\u09c7 \u09b6\u09c7\u0996\u09be \u09af\u09c7\u09a4 (\u09aa\u09cd\u09b0\u09a4\u09bf\u099f\u09bf\u09a4\u09c7 \u2248 \u09ec\u09e6\u09e6 \u0998\u09a3\u09cd\u099f\u09be)",
+                  "\u09ac\u0987 \u09aa\u09a1\u09bc\u09be" to "\u09aa\u09cd\u09b0\u09be\u09af\u09bc ${(estHours / 6).toInt()} \u099f\u09bf \u09ac\u0987 \u09aa\u09a1\u09bc\u09be \u09af\u09c7\u09a4 (\u09aa\u09cd\u09b0\u09a4\u09bf\u099f\u09bf \u2248 \u09ec \u0998\u09a3\u09cd\u099f\u09be)",
+                  "\u09a8\u09a4\u09c1\u09a8 \u09a6\u0995\u09cd\u09b7\u09a4\u09be" to "${f1(estHours / 400)} \u099f\u09bf \u0995\u09be\u099c\u09c7\u09b0 \u09a6\u0995\u09cd\u09b7\u09a4\u09be (\u0995\u09cb\u09a1\u09bf\u0982, \u09a1\u09bf\u099c\u09be\u0987\u09a8, \u09ad\u09bf\u09a1\u09bf\u0993 \u098f\u09a1\u09bf\u099f\u09bf\u0982) \u09b6\u09c7\u0996\u09be \u09af\u09c7\u09a4 (\u09aa\u09cd\u09b0\u09a4\u09bf\u099f\u09bf\u09a4\u09c7 \u2248 \u09ea\u09e6\u09e6 \u0998\u09a3\u09cd\u099f\u09be)",
+                  "\u09b9\u09be\u0981\u099f\u09be" to "${(estHours * 5).toInt()} \u0995\u09bf\u09ae\u09bf \u09b9\u09be\u0981\u099f\u09be \u09af\u09c7\u09a4, \u09af\u09be \u09aa\u09c3\u09a5\u09bf\u09ac\u09c0 \u09aa\u09cd\u09b0\u09a6\u0995\u09cd\u09b7\u09bf\u09a3\u09c7\u09b0 ${f1(estHours * 5 / 40075)} \u0997\u09c1\u09a3"
+              )
+
+              val funny = listOf(
+                  "\u09b8\u09ae\u09af\u09bc\u099f\u09be \u0986\u09b8\u09b2\u09c7 \u0995\u09a4?" to "${(estHours / 24).toInt()} \u09a6\u09bf\u09a8, \u09ae\u09be\u09a8\u09c7 \u09aa\u09cd\u09b0\u09be\u09af\u09bc ${f1(estHours / 24 / 365)} \u09ac\u099b\u09b0 \u09a6\u09bf\u09a8\u09b0\u09be\u09a4 \u098f\u0995\u099f\u09be\u09a8\u09be \u09ab\u09cb\u09a8\u09c7!",
+                  "\u0997\u09b0\u09c1\u09b0 \u0996\u09be\u09ae\u09be\u09b0" to "\u098f\u0987 ${(estHours / 8).toInt()} \u0995\u09b0\u09cd\u09ae\u09a6\u09bf\u09ac\u09b8 \u0997\u09b0\u09c1\u09b0 \u0996\u09be\u09ae\u09be\u09b0\u09c7 \u09a6\u09bf\u09b2\u09c7 \u098f\u09a4\u09a6\u09bf\u09a8\u09c7 ${(estHours / 50).toInt()} \u099f\u09be \u0997\u09b0\u09c1\u09b0 \u09ae\u09be\u09b2\u09bf\u0995 \u09b9\u09a4\u09c7\u09a8, \u09aa\u09be\u09a1\u09bc\u09be\u09af\u09bc \u09b8\u09ac\u09be\u0987 '\u0996\u09be\u09ae\u09be\u09b0\u09bf \u09ad\u09be\u0987' \u09a1\u09be\u0995\u09a4\u0964 \u0995\u09cb\u099f\u09bf\u09aa\u09a4\u09bf \u09b9\u0993\u09af\u09bc\u09be\u09b0 \u09aa\u09a5\u09c7 \u0985\u09a8\u09c7\u0995\u099f\u09be\u0987 \u098f\u0997\u09bf\u09af\u09bc\u09c7 \u09af\u09c7\u09a4\u09c7\u09a8!",
+                  "\u0998\u09a3\u09cd\u099f\u09be\u09af\u09bc \u09e8\u09e6\u09e6 \u099f\u09be\u0995\u09be\u09b0 \u0995\u09be\u099c" to "\u0998\u09a3\u09cd\u099f\u09be\u09af\u09bc \u09ae\u09be\u09a4\u09cd\u09b0 \u09e8\u09e6\u09e6 \u099f\u09be\u0995\u09be \u0995\u09be\u09ae\u09be\u09b2\u09c7\u0993 \u098f\u09a4\u09a6\u09bf\u09a8\u09c7 ${"%,d".format((estHours * 200).toLong())} \u099f\u09be\u0995\u09be \u09b9\u09a4\u09cb\u0964 \u0993\u0987 \u099f\u09be\u0995\u09be \u09b8\u09cd\u0995\u09cd\u09b0\u09b2\u09bf\u0982 \u0995\u09b0\u09c7 \u0989\u09a1\u09bc\u09c7 \u0997\u09c7\u099b\u09c7!",
+                  "\u0998\u09c1\u09ae" to "\u098f\u0987 \u09b8\u09ae\u09af\u09bc \u0998\u09c1\u09ae\u09be\u09b2\u09c7 \u098f\u0995\u099f\u09be\u09a8\u09be ${f1(estHours / 8)} \u09b0\u09be\u09a4, \u09ae\u09be\u09a8\u09c7 \u09aa\u09cd\u09b0\u09be\u09af\u09bc ${f1(estHours / 8 / 365)} \u09ac\u099b\u09b0 \u0998\u09c1\u09ae\u09be\u09a4\u09c7 \u09aa\u09be\u09b0\u09a4\u09c7\u09a8\u0964 \u0995\u09c1\u09ae\u09cd\u09ad\u0995\u09b0\u09cd\u09a3\u0993 \u09b2\u099c\u09cd\u099c\u09be \u09aa\u09c7\u09a4!",
+                  "\u098f\u09ad\u09be\u09b0\u09c7\u09b8\u09cd\u099f \u0985\u09ad\u09bf\u09af\u09be\u09a8" to "\u098f\u09ad\u09be\u09b0\u09c7\u09b8\u09cd\u099f \u0985\u09ad\u09bf\u09af\u09be\u09a8\u09c7 \u2248 \u09eb\u09e6\u09e6 \u0998\u09a3\u09cd\u099f\u09be \u09a7\u09b0\u09b2\u09c7 ${f1(estHours / 500)} \u09ac\u09be\u09b0 \u099a\u09c2\u09a1\u09bc\u09be\u09af\u09bc \u0989\u09a0\u09c7 \u09af\u09c7\u09a4\u09c7\u09a8\u0964 \u09ab\u09cb\u09a8\u09c7 \u09b6\u09c1\u09a7\u09c1 \u0986\u0999\u09c1\u09b2 \u0989\u09a0\u09c7\u099b\u09c7, \u09aa\u09be\u09b9\u09be\u09a1\u09bc\u09c7 \u0993\u09a0\u09be \u09b9\u09af\u09bc\u09a8\u09bf!",
+                  "\u09b8\u09bf\u09a8\u09c7\u09ae\u09be \u09ae\u09cd\u09af\u09be\u09b0\u09be\u09a5\u09a8" to "\u09e9 \u0998\u09a3\u09cd\u099f\u09be\u09b0 \u09b8\u09bf\u09a8\u09c7\u09ae\u09be \u09a7\u09b0\u09b2\u09c7 ${(estHours / 3).toInt()} \u099f\u09be \u09b8\u09bf\u09a8\u09c7\u09ae\u09be \u09a6\u09c7\u0996\u09be \u09b9\u09af\u09bc\u09c7 \u09af\u09c7\u09a4\u0964 \u09aa\u09aa\u0995\u09b0\u09cd\u09a8\u09c7\u09b0 \u0996\u09b0\u099a \u0986\u09b2\u09be\u09a6\u09be!",
+                  "\u099a\u09be\u09af\u09bc\u09c7\u09b0 \u09b8\u09cd\u099f\u09b2" to "\u0998\u09a3\u09cd\u099f\u09be\u09af\u09bc \u09e7\u09e6 \u0995\u09be\u09aa \u099a\u09be \u09ac\u09c7\u099a\u09b2\u09c7 ${"%,d".format((estHours * 10).toLong())} \u0995\u09be\u09aa \u099a\u09be \u09ac\u09bf\u0995\u09cd\u09b0\u09bf \u09b9\u09a4\u09cb\u0964 \u09aa\u09c1\u09b0\u09cb \u098f\u09b2\u09be\u0995\u09be \u0986\u09aa\u09a8\u09be\u09b0 \u09b8\u09cd\u099f\u09b2\u09c7 \u09b2\u09be\u0987\u09a8 \u09a6\u09bf\u09a4!"
+              )
+
+              LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                  item {
+                      Text("\u0986\u099c\u0995\u09c7\u09b0 \u09b8\u09cd\u0995\u09cd\u09b0\u09bf\u09a8 \u099f\u09be\u0987\u09ae", style = MaterialTheme.typography.titleMedium)
+                      Text(fmt(total), style = MaterialTheme.typography.displaySmall)
+                      Spacer(Modifier.height(12.dp))
+                      Text("\u0997\u09a4 \u09ed \u09a6\u09bf\u09a8", style = MaterialTheme.typography.titleMedium)
+                      Row(
+                          Modifier.fillMaxWidth().height(100.dp),
+                          horizontalArrangement = Arrangement.spacedBy(6.dp),
+                          verticalAlignment = Alignment.Bottom
+                      ) {
+                          week.forEach { ms ->
+                              Box(
+                                  Modifier.weight(1f)
+                                      .fillMaxHeight((ms.toFloat() / maxDay).coerceAtLeast(0.03f))
+                                      .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(4.dp))
+                              )
+                          }
+                      }
+                  }
+                  item {
+                      InfoCard(
+                          "\u09ab\u09cb\u09a8\u09c7 \u09aa\u09be\u0993\u09af\u09bc\u09be \u09ae\u09cb\u099f \u09a1\u09c7\u099f\u09be",
+                          "${fmtLong(lifeTotal)}\n\u09a1\u09c7\u099f\u09be \u09b6\u09c1\u09b0\u09c1: ${java.text.SimpleDateFormat("dd MMM yyyy", java.util.Locale.getDefault()).format(lifeSince)}\n(Android \u098f\u09b0 \u099a\u09c7\u09af\u09bc\u09c7 \u09aa\u09c1\u09b0\u09cb\u09a8\u09cb \u09a4\u09a5\u09cd\u09af \u09b0\u09be\u0996\u09c7 \u09a8\u09be)"
+                      )
+                  }
+                  item {
+                      Text("\u0995\u09a4 \u09ac\u099b\u09b0 \u09a7\u09b0\u09c7 \u09ab\u09cb\u09a8 \u09ac\u09cd\u09af\u09ac\u09b9\u09be\u09b0 \u0995\u09b0\u099b\u09c7\u09a8?", style = MaterialTheme.typography.titleMedium)
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          (1..5).forEach { y ->
+                              val pick = { years = y; prefs.edit().putInt("years", y).apply() }
+                              if (y == years) Button(onClick = pick, contentPadding = PaddingValues(horizontal = 14.dp)) { Text("$y") }
+                              else OutlinedButton(onClick = pick, contentPadding = PaddingValues(horizontal = 14.dp)) { Text("$y") }
+                          }
+                      }
+                  }
+                  item {
+                      InfoCard(
+                          "\u0986\u09a8\u09c1\u09ae\u09be\u09a8\u09bf\u0995 \u09ae\u09cb\u099f \u09ac\u09cd\u09af\u09ac\u09b9\u09be\u09b0 ($years \u09ac\u099b\u09b0\u09c7)",
+                          "${fmtLong((estHours * 3_60
